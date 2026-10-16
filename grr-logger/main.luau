@@ -1,440 +1,582 @@
-local fs=require("@lune/fs")
-local luau=require("@lune/luau")
-local process=require("@lune/process")
-local host_type=type
-local host_tostring=tostring
-local host_pairs=pairs
-local host_ipairs=ipairs
-local host_next=next
-local host_pcall=pcall
-local host_error=error
-local host_rawset=rawset
-local host_rawget=rawget
-local host_setmetatable=setmetatable
-local host_rawequal=rawequal
-local host_getmetatable=getmetatable
-local host_print=print
-local host_table=table
-local host_string=string
-local input_path=process.args[1] or "input.luau"
-local output_path=process.args[2] or "out.lua"
-if input_path==output_path then host_error("input and output paths must be different",0) end
-if not fs.isFile(input_path) then host_error("input file not found: "..input_path,0) end
-local source=fs.readFile(input_path)
-local events={}
-local proxy_info=host_setmetatable({}, {__mode="k"})
-local bootstrap_names={assert=true,error=true,ipairs=true,pairs=true,next=true,pcall=true,xpcall=true,select=true,tonumber=true,tostring=true,type=true,typeof=true,rawequal=true,rawget=true,rawset=true,setmetatable=true,getmetatable=true,getfenv=true,setfenv=true,unpack=true,load=true,loadstring=true,require=true,print=true,warn=true,wait=true,task=true,game=true,Game=true,workspace=true,Workspace=true,script=true,shared=true,_G=true,_VERSION=true,string=true,table=true,math=true,utf8=true,bit32=true,os=true,coroutine=true,debug=true,buffer=true,package=true,Vector2=true,Vector3=true,Vector2int16=true,Vector3int16=true,CFrame=true,Color3=true,ColorSequence=true,ColorSequenceKeypoint=true,UDim=true,UDim2=true,NumberRange=true,NumberSequence=true,NumberSequenceKeypoint=true,Rect=true,BrickColor=true,TweenInfo=true,Ray=true,RaycastParams=true,OverlapParams=true,PhysicalProperties=true,Random=true,DateTime=true,Font=true,Axes=true,Faces=true,Enum=true,Instance=true,Drawing=true,newproxy=true,makefolder=true,writefile=true,readfile=true,isfile=true,isfolder=true,listfiles=true,delfile=true,delfolder=true,appendfile=true,identifyexecutor=true,getexecutorname=true,getgenv=true,getrenv=true,checkcaller=true,hookfunction=true,hookmetamethod=true,getrawmetatable=true,setreadonly=true,cloneref=true,clonefunction=true,newcclosure=true,islclosure=true,iscclosure=true,isexecutorclosure=true,getgc=true,getconnections=true,getupvalue=true,getupvalues=true,getconstants=true,getsenv=true,getscripts=true,getrunningscripts=true,queue_on_teleport=true,queueonteleport=true,setfpscap=true,setclipboard=true,toclipboard=true,request=true,http_request=true,httpRequest=true,HttpRequest=true,getnamecallmethod=true,setnamecallmethod=true,gethiddenproperty=true,sethiddenproperty=true,gethui=true,getrenderproperty=true,setrenderproperty=true,isrenderobj=true,cleardrawcache=true,fireproximityprompt=true,firetouchinterest=true,firesignal=true,getscripthash=true,getthreadidentity=true,setthreadidentity=true,getidentity=true,setidentity=true,getthreadcontext=true,setthreadcontext=true,restorefunction=true,isrbxactive=true,isgameactive=true,queue_on_teleport=true,queueonteleport=true,readclipboard=true,writeclipboard=true}
-local function record(kind,data)
- data.kind=kind
- data.id=#events+1
- host_table.insert(events,data)
- return data.id
+--grr logger 
+--credits to : v1x , .Anonym in discord
+--fully handcoded envinronment logger !
+
+local fs = require('@lune/fs')
+local process = require('@lune/process')
+local task = require('@lune/task')
+local roblox = require('@lune/roblox')
+local luau = require('@lune/luau')
+
+local input = assert(process.args[1], 'Usage: lune run main.lua <input.lua> [output.lua]')
+local lines, jobs, errors = {}, {}, {}
+local refs, names, cache = {}, {}, {}
+local env, globals = {}, {}
+local mocks = {}
+local nextVar = 0
+local fenvLogged, useMocks = false, false
+local scriptSources = {}
+local callbacks, callbackCache, contexts = {}, {}, {}
+local STOP, YIELD = {}, {}
+
+names[env] = 'fenv'
+
+local function instrument(source)
+	local parts = {}
+	local first, i = 1, 1
+	while i <= #source do
+		local char = source:sub(i, i)
+		local comment = source:sub(i, i + 1) == '--'
+		local start = comment and i + 2 or i
+		local equals = source:sub(start):match('^%[(=*)%[')
+		if equals then
+			local _, last = source:find(']' .. equals .. ']', start + 2 + #equals, true)
+			i = (last or #source) + 1
+		elseif comment then
+			i = source:find('\n', i + 2, true) or (#source + 1)
+		elseif char == '"' or char == "'" or char == '`' then
+			i += 1
+			while i <= #source do
+				if source:sub(i, i) == '\\' then
+					i += 2
+				elseif source:sub(i, i) == char then
+					i += 1
+					break
+				else
+					i += 1
+				end
+			end
+		elseif char:match('[%a_]') then
+			local _, last = source:find('^[%w_]+', i)
+			local word = source:sub(i, last)
+			i = last + 1
+			if word == 'do' or word == 'repeat' then
+				parts[#parts + 1] = source:sub(first, last) .. ' __envlogger_step();'
+				first = i
+			end
+		else
+			i += 1
+		end
+	end
+	parts[#parts + 1] = source:sub(first)
+	return table.concat(parts)
 end
-local function mark_used(value)
- local info=proxy_info[value]
- if info and info.event_id and events[info.event_id] then events[info.event_id].skip=true end
+
+local function loadChunk(source, name)
+	local options = { environment = env, injectGlobals = false, debugName = name }
+	local ok, fn = pcall(luau.load, instrument(source), options)
+	if not ok then fn = luau.load(source, options) end
+	scriptSources[debug.info(fn, 's')] = ok or nil
+	callbackCache[fn] = false
+	return fn
 end
-local function format_value(value,seen,depth)
- local info=proxy_info[value]
- if info then
-  mark_used(value)
-  return info.path
- end
- local kind=host_type(value)
- if kind=="nil" then return "nil" end
- if kind=="string" then return host_string.format("%q",value) end
- if kind=="number" or kind=="boolean" then return host_tostring(value) end
- if kind=="function" then return "function(...) end" end
- if kind~="table" then return "nil" end
- if depth and depth>2 then return "{}" end
- seen=seen or {}
- if seen[value] then return "{}" end
- seen[value]=true
- local parts={}
- local count=0
- for key,item in host_pairs(value) do
-  count+=1
-  if count>8 then break end
-  local key_text
-  if host_type(key)=="string" and host_string.match(key,"^[%a_][%w_]*$") then
-   key_text=key
-  else
-   key_text="["..format_value(key,seen,(depth or 0)+1).."]"
-  end
-  host_table.insert(parts,key_text.." = "..format_value(item,seen,(depth or 0)+1))
- end
- seen[value]=nil
- return "{"..host_table.concat(parts,", ").."}"
+
+local function emit(text)
+	local context = contexts[coroutine.running()]
+	local target = context and context.rows or lines
+	if context and context.mode and #target >= 80 then error(STOP, 0) end
+	local row = { text }
+	target[#target + 1] = row
+	return row
 end
-local function format_args(args,start_index)
- local parts={}
- for i=start_index or 1,args.n do host_table.insert(parts,format_value(args[i])) end
- return host_table.concat(parts,", ")
+
+local function getCallback(fn, hint)
+	if callbackCache[fn] == false then return nil end
+	if not scriptSources[debug.info(fn, 's')] then return nil end
+	if not callbackCache[fn] then
+		local arity, vararg = debug.info(fn, 'a')
+		local record = { id = #callbacks + 1, fn = fn, arity = arity, vararg = vararg, rows = {} }
+		callbacks[#callbacks + 1], callbackCache[fn] = record, record
+	end
+	local record = callbackCache[fn]
+	if hint and hint.Callback == fn then record.hint = hint end
+	return record
 end
-local proxy_mt={}
-local function make_proxy(path,parent_path,key,event_id,object_type,typename)
- local value={}
- proxy_info[value]={path=path,parent_path=parent_path,key=key,event_id=event_id,object_type=object_type or "unknown",typename=typename}
- return host_setmetatable(value,proxy_mt)
+
+local function fmt(value, seen, hint)
+	if names[value] then return names[value] end
+	local kind = type(value)
+	if kind == 'string' then return string.format('%q', value) end
+	if kind == 'function' then
+		local record = getCallback(value, hint)
+		return record and ('\1' .. record.id .. '\2') or 'function(...) end'
+	end
+	if kind == 'thread' then return 'coroutine.create(function(...) end)' end
+	if kind ~= 'table' then return tostring(value) end
+	seen = seen or {}
+	if seen[value] then return '{}' end
+	seen[value] = true
+	local items = {}
+	for k, v in value do
+		items[#items + 1] = '[' .. fmt(k, seen) .. ']=' .. fmt(v, seen, value)
+	end
+	seen[value] = nil
+	return '{' .. table.concat(items, ', ') .. '}'
 end
-local method_names={GetService=true,FindFirstChild=true,FindFirstChildOfClass=true,FindFirstChildWhichIsA=true,WaitForChild=true,GetChildren=true,GetDescendants=true,IsA=true,Clone=true,Destroy=true,ClearAllChildren=true,GetFullName=true,GetAttribute=true,SetAttribute=true,GetAttributes=true,GetPropertyChangedSignal=true,FindFirstAncestor=true,FindFirstAncestorOfClass=true,FindFirstAncestorWhichIsA=true,Connect=true,Once=true,Disconnect=true,Fire=true,FireServer=true,FireClient=true,FireAllClients=true,InvokeServer=true,InvokeClient=true,BindToRenderStep=true,UnbindFromRenderStep=true,GetPlayers=true,GetUserIdFromNameAsync=true,GetNameFromUserIdAsync=true,GetRoleInGroup=true,GetRankInGroup=true,GetMouse=true,GetPivot=true,PivotTo=true,MoveTo=true,TakeDamage=true,ChangeState=true,Play=true,Stop=true,Pause=true,Resume=true,Wait=true,Spawn=true,wait=true,spawn=true,defer=true,delay=true,cancel=true,wrap=true,create=true}
-local scalar_types={Name="string",ClassName="string",DisplayName="string",UserId="number",AccountAge="number",Health="number",MaxHealth="number",WalkSpeed="number",JumpPower="number",Value="number",Text="string",Visible="boolean",Enabled="boolean",Archivable="boolean",AbsolutePosition="Vector2",AbsoluteSize="Vector2",Position="Vector3",Size="Vector3",CFrame="CFrame",Color="Color3",Transparency="number",CanCollide="boolean",Anchored="boolean",Material="EnumItem",Parent="Instance",Character="Instance",LocalPlayer="Instance",CurrentCamera="Instance",PrimaryPart="Instance",PlayerGui="Instance"}
-local datatype_names={Vector3=true,Vector2=true,Vector2int16=true,Vector3int16=true,CFrame=true,Color3=true,ColorSequence=true,UDim=true,UDim2=true,NumberRange=true,Rect=true,BrickColor=true}
-local function child_type(info,key)
- if info.object_type=="constructor" then
-  if key=="new" then return "function" end
-  return info.typename or "unknown"
- end
- if info.object_type=="enum" then return "EnumItem" end
- if info.object_type=="library" and method_names[key] then return "function" end
- if method_names[key] then return "function" end
- if info.object_type=="Instance" then return scalar_types[key] or "Instance" end
- return "unknown"
+
+local function field(path, key)
+	if type(key) == 'string' and key:match('^[%a_][%w_]*$') then return path .. '.' .. key end
+	return path .. '[' .. fmt(key) .. ']'
 end
-proxy_mt.__index=function(self,key)
- mark_used(self)
- local info=proxy_info[self]
- local suffix
- if host_type(key)=="string" and host_string.match(key,"^[%a_][%w_]*$") then
-  suffix="."..key
- else
-  suffix="["..format_value(key).."]"
- end
- local path=info.path..suffix
- local id=record("access",{path=path,code=path})
- return make_proxy(path,info.path,key,id,child_type(info,key),info.typename)
+
+local function read(path) emit('local _ = ' .. path) end
+local function fenv()
+	if not fenvLogged then
+		table.insert(lines, 1, { 'local fenv = getfenv()' })
+		fenvLogged = true
+	end
+	return env
 end
-proxy_mt.__newindex=function(self,key,value)
- mark_used(self)
- local info=proxy_info[self]
- local path
- if host_type(key)=="string" and host_string.match(key,"^[%a_][%w_]*$") then
-  path=info.path.."."..key
- else
-  path=info.path.."["..format_value(key).."]"
- end
- record("statement",{code=path.." = "..format_value(value)})
+
+local bind, wrap, stub
+local function call(path, fn, values)
+	local index = nextVar
+	nextVar += 1
+	local name = 'var' .. index
+	local items = {}
+	for i = 1, values.n do
+		items[i] = fmt(values[i])
+		values[i] = refs[values[i]] or values[i]
+	end
+	local expr = path .. '(' .. table.concat(items, ', ') .. ')'
+	local row = emit('local ' .. name .. ' = ' .. expr)
+	local result = table.pack(pcall(fn, table.unpack(values, 1, values.n)))
+	if not result[1] then
+		if result[2] == STOP or result[2] == YIELD then error(result[2], 0) end
+		if useMocks then
+			result = table.pack(true, stub(name))
+		else
+			row[1] = nil
+			if nextVar == index + 1 then
+				nextVar -= 1
+			end
+			error(result[2], 0)
+		end
+	end
+	local locals = { name }
+	for i = 3, result.n do
+		locals[#locals + 1] = name .. '_' .. (i - 1)
+	end
+	row[1] = 'local ' .. table.concat(locals, ', ') .. ' = ' .. expr
+	for i = 2, result.n do
+		result[i] = bind(result[i], locals[i - 1])
+	end
+	return table.unpack(result, 2, result.n)
 end
-proxy_mt.__call=function(self,...)
- mark_used(self)
- local info=proxy_info[self]
- local args=host_table.pack(...)
- local start_index=1
- local code
- if info.parent_path and args.n>0 then
-  local first=proxy_info[args[1]]
-  if first and first.path==info.parent_path then
-   start_index=2
-   mark_used(args[1])
-   code=info.parent_path..":"..host_tostring(info.key).."("..format_args(args,start_index)..")"
-  end
- end
- code=code or info.path.."("..format_args(args,start_index)..")"
- local id=record("call",{code=code,path=info.path})
- local result_type="unknown"
- if info.parent_path=="game" and info.key=="GetService" then
-  result_type="Instance"
- elseif info.parent_path=="Instance" and info.key=="new" then
-  result_type="Instance"
- elseif info.parent_path and datatype_names[info.parent_path] and info.key=="new" then
-  result_type=info.parent_path
- elseif info.parent_path=="getgenv" or info.parent_path=="getrenv" or info.parent_path=="getfenv" then
-  result_type="table"
- end
- return make_proxy(code,nil,nil,id,result_type)
+
+stub = function(path, parent, key)
+	local proxy, fields = {}, {}
+	names[proxy], mocks[proxy] = path, true
+	local mt = {
+		__index = function(_, k)
+			read(field(names[proxy], k))
+			if fields[k] == nil then fields[k] = stub(field(names[proxy], k), proxy, k) end
+			return fields[k]
+		end,
+		__newindex = function(_, k, v)
+			fields[k] = v
+			emit(field(names[proxy], k) .. ' = ' .. fmt(v))
+		end,
+		__call = function(_, ...)
+			local values = table.pack(...)
+			local method = parent and values[1] == parent
+			local expr = method and names[parent] .. ':' .. key or names[proxy]
+			if method then values = table.pack(table.unpack(values, 2, values.n)) end
+			return call(expr, function()
+				if key and key:match('^FindFirstChild') then return nil end
+				if key == 'GetChildren' or key == 'GetDescendants' or key == 'GetPlayers' then
+					return {}
+				end
+				return stub(expr)
+			end, values)
+		end,
+		__tostring = function() return names[proxy] end,
+		__len = function() return 0 end,
+		__unm = function() return stub('(-' .. names[proxy] .. ')') end,
+	}
+	for method, op in
+		{
+			__add = '+',
+			__sub = '-',
+			__mul = '*',
+			__div = '/',
+			__mod = '%',
+			__pow = '^',
+			__concat = '..',
+		}
+	do
+		mt[method] = function(a, b) return stub('(' .. fmt(a) .. ' ' .. op .. ' ' .. fmt(b) .. ')') end
+	end
+	return setmetatable(proxy, mt)
 end
-proxy_mt.__tostring=function(self) return proxy_info[self].path end
-proxy_mt.__eq=function(left,right)
- local a=proxy_info[left]
- local b=proxy_info[right]
- local code=format_value(left).." == "..format_value(right)
- record("expression",{code=code})
- return a~=nil and b~=nil and a.path==b.path
+
+bind = function(value, path)
+	if mocks[value] then
+		names[value] = path
+		return value
+	end
+	if typeof(value) == 'Instance' then return wrap(value, path) end
+	if type(value) == 'table' then
+		local result = {}
+		names[result] = path
+		for k, v in value do
+			result[k] = bind(v, field(path, k))
+		end
+		return result
+	end
+	if type(value) == 'function' or type(value) == 'thread' or type(value) == 'userdata' then
+		names[value] = names[value] or path
+	end
+	return value
 end
-proxy_mt.__concat=function(left,right)
- local code=format_value(left).." .. "..format_value(right)
- local id=record("expression",{code=code})
- return make_proxy(code,nil,nil,id,"string")
+
+wrap = function(value, path)
+	if cache[value] then return cache[value] end
+	local proxy, methods = {}, {}
+	refs[proxy], names[proxy], cache[value] = value, path, proxy
+	return setmetatable(proxy, {
+		__index = function(_, key)
+			local member = field(path, key)
+			local ok, result = pcall(function() return value[key] end)
+			if not ok then
+				if
+					({ HttpGet = true, HttpPost = true, GetAsync = true, PostAsync = true })[key]
+				then
+					result = function()
+						useMocks = true
+						return stub(member)
+					end
+				elseif useMocks then
+					return stub(member, proxy, key)
+				else
+					error(result, 0)
+				end
+			end
+			if result == nil and useMocks then return stub(member) end
+			if type(result) ~= 'function' then
+				read(member)
+				return bind(result, member)
+			end
+			if not methods[key] then
+				methods[key] = function(...)
+					local values = table.pack(...)
+					local method = values[1] == proxy
+					local expr = method and path .. ':' .. key or member
+					if method then
+						local tail = table.pack(table.unpack(values, 2, values.n))
+						return call(expr, function(...) return result(value, ...) end, tail)
+					end
+					return call(expr, result, values)
+				end
+				names[methods[key]] = member
+			end
+			return methods[key]
+		end,
+		__newindex = function(_, key, new)
+			value[key] = refs[new] or new
+			local member = field(path, key)
+			emit(member .. ' = ' .. fmt(new))
+		end,
+		__tostring = function() return tostring(value) end,
+		__len = function() return #value end,
+	})
 end
-local function binary(operator,left,right)
- local code=format_value(left).." "..operator.." "..format_value(right)
- local id=record("expression",{code=code})
- return make_proxy(code,nil,nil,id,"unknown")
+
+local function runCallback(record, values, rows, mode)
+	rows = rows or record.rows
+	local co = coroutine.running()
+	local previous = contexts[co]
+	contexts[co] = {
+		rows = rows,
+		mode = mode,
+		steps = 0,
+		deadline = os.clock() + 0.2,
+	}
+	local ok, err = pcall(record.fn, table.unpack(values, 1, values.n))
+	contexts[co] = previous
+	if not mode then record.observed = true end
+	if not ok and err ~= YIELD then
+		if err == STOP then
+			rows[#rows + 1] = { '--exp limit' }
+		elseif mode then
+			rows[#rows + 1] = { '--incomplete trace' .. tostring(err):gsub('[\r\n].*', '') }
+		else
+			errors[#errors + 1] = tostring(err)
+		end
+	end
 end
-proxy_mt.__add=function(a,b) return binary("+",a,b) end
-proxy_mt.__sub=function(a,b) return binary("-",a,b) end
-proxy_mt.__mul=function(a,b) return binary("*",a,b) end
-proxy_mt.__div=function(a,b) return binary("/",a,b) end
-proxy_mt.__idiv=function(a,b) return binary("//",a,b) end
-proxy_mt.__mod=function(a,b) return binary("%",a,b) end
-proxy_mt.__pow=function(a,b) return binary("^",a,b) end
-proxy_mt.__unm=function(value)
- local code="-"..format_value(value)
- local id=record("expression",{code=code})
- return make_proxy(code,nil,nil,id,"number")
+
+local function probe(record, values, rows)
+	local co = task.spawn(runCallback, record, values, rows, 'probe')
+	local deadline = os.clock() + 0.25
+	while coroutine.status(co) ~= 'dead' and os.clock() < deadline do
+		task.wait(0.001)
+	end
+	if coroutine.status(co) ~= 'dead' then
+		task.cancel(co)
+		contexts[co] = nil
+		rows[#rows + 1] = { '--exp paused' }
+	end
 end
-proxy_mt.__len=function(value)
- local code="#"..format_value(value)
- record("expression",{code=code})
- return 0
+
+local function launch(method, seconds, fn, ...)
+	assert(type(fn) == 'function' or type(fn) == 'thread', 'expected function or thread')
+	local values = table.pack(...)
+	local context = contexts[coroutine.running()]
+	local record = type(fn) == 'function' and getCallback(fn)
+	if context and context.mode then
+		if record and not record.observed then
+			record.observed = true
+			runCallback(record, values, nil, 'once')
+		end
+		return coroutine.create(function() end)
+	end
+	local callback = fn
+	if type(fn) == 'function' then
+		callback = function()
+			if record then
+				runCallback(record, values)
+				return
+			end
+			local ok, err = pcall(fn, table.unpack(values, 1, values.n))
+			if not ok then errors[#errors + 1] = tostring(err) end
+		end
+	end
+	local co
+	if method == 'delay' then
+		co = task.delay(seconds, callback, table.unpack(values, 1, values.n))
+	else
+		co = task[method](callback, table.unpack(values, 1, values.n))
+	end
+	jobs[#jobs + 1] = co
+	return co
 end
-proxy_mt.__lt=function(a,b)
- local code=format_value(a).." < "..format_value(b)
- record("expression",{code=code})
- return false
+--credits to : v1x , .Anonym in discord
+local base = getfenv()
+local builtinNames = string.split(
+	'assert error type tostring tonumber pairs ipairs next select unpack pcall xpcall getmetatable setmetatable newproxy rawequal rawget rawset rawlen',
+	' '
+)
+for _, key in builtinNames do
+	globals[key] = base[key]
 end
-proxy_mt.__le=function(a,b)
- local code=format_value(a).." <= "..format_value(b)
- record("expression",{code=code})
- return false
+for _, key in { 'string', 'math', 'table', 'bit32', 'utf8', 'buffer', 'coroutine', 'os' } do
+	globals[key] = table.clone(base[key])
 end
-proxy_mt.__iter=function(value)
- local path=proxy_info[value].path
- mark_used(value)
- record("statement",{code="for _ in "..path.." do end"})
- return function() return nil end
+globals.unpack = table.unpack
+globals.typeof = function(value) return typeof(refs[value] or value) end
+local game = roblox.Instance.new('DataModel')
+local world = game:GetService('Workspace')
+local players = game:GetService('Players')
+local player = roblox.Instance.new('Player')
+player.DisplayName, player.Parent = player.Name, players
+players.LocalPlayer = player
+for _, class in { 'Camera', 'Terrain' } do
+	roblox.Instance.new(class).Parent = world
 end
-proxy_mt.__metatable="locked"
-local function make_library(name,library)
- local result={}
- local native_table_calls={pack=true,unpack=true,move=true,concat=true,insert=true,remove=true,clone=true,clear=true,freeze=true,create=true,find=true,sort=true,reverse=true}
- for key,value in host_pairs(library) do
-  if host_type(value)=="function" then
-   result[key]=(function(fn,method)
-    return function(...)
-     local args=host_table.pack(...)
-     local code=name.."."..method.."("..format_args(args)..")"
-     local has_proxy=false
-     for i=1,args.n do
-      if proxy_info[args[i]] then has_proxy=true break end
-     end
-     local id=record("call",{code=code})
-     if has_proxy then
-      if name=="table" and native_table_calls[method] and not proxy_info[args[1]] then return fn(...) end
-      return make_proxy(code,nil,nil,id,"unknown")
-     end
-     return fn(...)
-    end
-   end)(value,key)
-  else
-   result[key]=value
-  end
- end
- return result
+globals.game, globals.workspace = wrap(game, 'game'), wrap(world, 'workspace')
+globals.script = wrap(roblox.Instance.new('LocalScript'), 'script')
+local robloxTypes = {
+	'Instance',
+	'Enum',
+	'Vector2',
+	'Vector3',
+	'CFrame',
+	'Color3',
+	'UDim',
+	'UDim2',
+	'Rect',
+	'Ray',
+	'BrickColor',
+	'TweenInfo',
+}
+for _, key in robloxTypes do
+	if roblox[key] then globals[key] = wrap(roblox[key], key) end
 end
-local function output_call(name,...)
- local args=host_table.pack(...)
- local rendered={}
- for i=1,args.n do host_table.insert(rendered,format_value(args[i])) end
- local code=name.."("..host_table.concat(rendered,", ")..")"
- record("statement",{code=code})
- host_print(host_table.concat(rendered,"\t"))
+globals.task = wrap({
+	spawn = function(fn, ...) return launch('spawn', 0, fn, ...) end,
+	defer = function(fn, ...) return launch('defer', 0, fn, ...) end,
+	delay = function(seconds, fn, ...) return launch('delay', seconds, fn, ...) end,
+	wait = function(seconds)
+		local context = contexts[coroutine.running()]
+		if context and context.mode then
+			if context.mode == 'once' then error(YIELD, 0) end
+			return seconds or 0
+		end
+		return task.wait(seconds)
+	end,
+	cancel = task.cancel,
+}, 'task')
+globals.spawn, globals.delay, globals.wait =
+	globals.task.spawn, globals.task.delay, globals.task.wait
+globals.print = function(...)
+	return call('print', function() end, table.pack(...))
 end
-local function sandbox_type(value)
- if proxy_info[value] then
-  record("call",{code="type("..format_value(value)..")"})
-  local kind=proxy_info[value].object_type
-  if kind=="function" or kind=="string" or kind=="number" or kind=="boolean" then return kind end
-  return "table"
- end
- return host_type(value)
+globals.warn = function(...)
+	return call('warn', function() end, table.pack(...))
 end
-local function sandbox_typeof(value)
- if proxy_info[value] then
-  record("call",{code="typeof("..format_value(value)..")"})
-  local result=proxy_info[value].object_type
-  if result=="unknown" then return "table" end
-  return result
- end
- return host_type(value)
+globals.require = function(...)
+	return call('require', function()
+		useMocks = true
+		return stub('require')
+	end, table.pack(...))
 end
-local function sandbox_pairs(value)
- if proxy_info[value] then
-  record("statement",{code="for _ in pairs("..format_value(value)..") do end"})
-  return function() return nil end
- end
- return host_pairs(value)
+globals.debug = wrap(debug, 'debug')
+globals.coroutine = wrap(coroutine, 'coroutine')
+globals.getfenv, globals.getgenv = fenv, fenv
+globals.setfenv = setfenv
+globals._G, globals._ENV = env, env
+globals.__envlogger_step = function()
+	local context = contexts[coroutine.running()]
+	if context and context.mode then
+		context.steps += 1
+		if
+			context.steps > 30000 or (context.steps % 1000 == 0 and os.clock() > context.deadline)
+		then
+			error(STOP, 0)
+		end
+	end
 end
-local function sandbox_ipairs(value)
- if proxy_info[value] then
-  record("statement",{code="for _ in ipairs("..format_value(value)..") do end"})
-  return function() return nil end
- end
- return host_ipairs(value)
+globals.loadstring = function(source, name)
+	if mocks[source] then
+		local fn
+		fn = function(...)
+			return call(names[fn], function() return stub(names[fn]) end, table.pack(...))
+		end
+		return call('loadstring', function() return fn end, table.pack(source))
+	end
+	return call('loadstring', function(src, label)
+		local ok, loaded = pcall(loadChunk, src, label or 'loadstring')
+		if not ok then return nil, loaded end
+		local fn
+		fn = function(...) return call(names[fn], loaded, table.pack(...)) end
+		return fn
+	end, name and table.pack(source, name) or table.pack(source))
 end
-local function sandbox_next(value,...)
- if proxy_info[value] then
-  record("call",{code="next("..format_value(value)..")"})
-  return nil
- end
- return host_next(value,...)
-end
-local function sandbox_require(path)
- local code="require("..format_value(path)..")"
- local id=record("call",{code=code})
- return make_proxy(code,nil,nil,id,"table")
-end
-local function sandbox_loadstring(value)
- local code="loadstring("..format_value(value)..")"
- local id=record("call",{code=code})
- return make_proxy(code,nil,nil,id,"function")
-end
-local env={}
-env.assert=assert
-env.error=error
-env.ipairs=sandbox_ipairs
-env.pairs=sandbox_pairs
-env.next=sandbox_next
-env.pcall=pcall
-env.xpcall=xpcall
-env.select=select
-env.tonumber=function(value,base)
- if proxy_info[value] then
-  local code="tonumber("..format_value(value)..(base~=nil and ", "..format_value(base) or "")..")"
-  local id=record("call",{code=code})
-  return make_proxy(code,nil,nil,id,"number")
- end
- return tonumber(value,base)
-end
-env.tostring=function(value) if proxy_info[value] then record("call",{code="tostring("..format_value(value)..")"});return format_value(value) end return host_tostring(value) end
-env.type=sandbox_type
-env.typeof=sandbox_typeof
-env.rawequal=function(a,b)
- if proxy_info[a] or proxy_info[b] then
-  local left=format_value(a)
-  local right=format_value(b)
-  record("expression",{code="rawequal("..left..", "..right..")"})
-  local first=proxy_info[a]
-  local second=proxy_info[b]
-  return first~=nil and second~=nil and first.path==second.path
- end
- return host_rawequal(a,b)
-end
-env.rawget=function(value,key)
- if proxy_info[value] or proxy_info[key] then
-  local path=proxy_info[value] and proxy_info[value].path or "rawget_table"
-  local index=format_value(key)
-  local code="rawget("..format_value(value)..", "..index..")"
-  mark_used(value)
-  local id=record("call",{code=code})
-  return make_proxy(proxy_info[value] and path.."["..index.."]" or code,nil,nil,id,"unknown")
- end
- return host_rawget(value,key)
-end
-env.rawset=function(value,key,item)
- if proxy_info[value] then
-  local info=proxy_info[value]
-  mark_used(value)
-  record("statement",{code=info.path.."["..format_value(key).."] = "..format_value(item)})
-  return value
- end
- return host_rawset(value,key,item)
-end
-env.setmetatable=function(value,meta)
- if proxy_info[value] then
-  record("statement",{code="setmetatable("..format_value(value)..", "..format_value(meta)..")"})
-  return value
- end
- return host_setmetatable(value,meta)
-end
-env.getmetatable=function(value)
- if proxy_info[value] then
-  local code="getmetatable("..format_value(value)..")"
-  local id=record("call",{code=code})
-  return make_proxy(code,nil,nil,id,"table")
- end
- return host_getmetatable(value)
-end
-env.math=make_library("math",math)
-env.string=make_library("string",string)
-env.table=make_library("table",table)
-env.utf8=make_library("utf8",utf8)
-env.bit32=make_library("bit32",bit32)
-env.unpack=env.table.unpack
-env.print=function(...) output_call("print",...) end
-env.warn=function(...) output_call("warn",...) end
-env.require=sandbox_require
-env.loadstring=sandbox_loadstring
-env.load=sandbox_loadstring
-env.getfenv=function(level)
- local code="getfenv("..format_value(level)..")"
- local id=record("call",{code=code})
- return make_proxy(code,nil,nil,id,"table")
-end
-env.setfenv=function(fn) record("statement",{code="setfenv("..format_value(fn)..", ...)"});return fn end
-env.wait=make_proxy("wait",nil,nil,nil,"function")
-env.task=make_proxy("task",nil,nil,nil,"library")
-env._VERSION="Luau"
-env.game=make_proxy("game",nil,nil,nil,"Instance")
-env.Game=env.game
-env.workspace=make_proxy("workspace",nil,nil,nil,"Instance")
-env.Workspace=env.workspace
-env.script=make_proxy("script",nil,nil,nil,"Instance")
-env.Enum=make_proxy("Enum",nil,nil,nil,"enum")
-for _,name in {"Instance","Vector2","Vector3","Vector2int16","Vector3int16","CFrame","Color3","ColorSequence","ColorSequenceKeypoint","UDim","UDim2","NumberRange","NumberSequence","NumberSequenceKeypoint","Rect","BrickColor","TweenInfo","Ray","RaycastParams","OverlapParams","PhysicalProperties","Random","DateTime","Font","Axes","Faces"} do
- env[name]=make_proxy(name,nil,nil,nil,"constructor",name)
-end
-env.shared=make_proxy("shared",nil,nil,nil,"table")
-local function_names={newproxy=true,makefolder=true,writefile=true,readfile=true,isfile=true,isfolder=true,listfiles=true,delfile=true,delfolder=true,appendfile=true,identifyexecutor=true,getexecutorname=true,getgenv=true,getrenv=true,checkcaller=true,hookfunction=true,hookmetamethod=true,getrawmetatable=true,setreadonly=true,cloneref=true,clonefunction=true,newcclosure=true,islclosure=true,iscclosure=true,isexecutorclosure=true,getgc=true,getconnections=true,getupvalue=true,getupvalues=true,getconstants=true,getsenv=true,getscripts=true,getrunningscripts=true,queue_on_teleport=true,queueonteleport=true,setfpscap=true,setclipboard=true,toclipboard=true,request=true,http_request=true,httpRequest=true,HttpRequest=true,getnamecallmethod=true,setnamecallmethod=true,gethiddenproperty=true,sethiddenproperty=true,gethui=true,getrenderproperty=true,setrenderproperty=true,isrenderobj=true,cleardrawcache=true,fireproximityprompt=true,firetouchinterest=true,firesignal=true,getscripthash=true,getthreadidentity=true,setthreadidentity=true,getidentity=true,setidentity=true,getthreadcontext=true,setthreadcontext=true,restorefunction=true,isrbxactive=true,isgameactive=true,readclipboard=true,writeclipboard=true}
-for name in bootstrap_names do
- if env[name]==nil then env[name]=make_proxy(name,nil,nil,nil,function_names[name] and "function" or "unknown") end
-end
-local function is_bootstrap_assignment(key,value)
- if not bootstrap_names[key] then return false end
- local info=proxy_info[value]
- if info then return info.path==key or key=="Game" and info.path=="game" or key=="Workspace" and info.path=="workspace" end
- local kind=host_type(value)
- if kind=="function" then return true end
- if kind=="table" and (key=="_G" or key=="string" or key=="table" or key=="math" or key=="utf8" or key=="bit32" or key=="os" or key=="coroutine" or key=="debug" or key=="buffer" or key=="package") then return true end
- return key=="_VERSION" and value=="Luau"
-end
-local globals=env
-env={}
-globals._G=env
-proxy_info[env]={path="_G",object_type="table"}
-setmetatable(env,{
- __index=function(_,key)
-  local value=globals[key]
-  if value~=nil then return value end
-  local name=host_tostring(key)
-  local id=record("access",{path=name,code=name})
-  return make_proxy(name,nil,nil,id,"unknown")
- end,
- __newindex=function(_,key,value)
-  if is_bootstrap_assignment(key,value) then return end
-  local name=host_tostring(key)
-  record("statement",{code=name.." = "..format_value(value)})
-  globals[key]=value
- end
+
+local builtins = table.clone(globals)
+setmetatable(env, {
+	__index = function(_, key)
+		if not builtins[key] then
+			fenv()
+			read('fenv[' .. fmt(key) .. ']')
+		end
+		local context = contexts[coroutine.running()]
+		if globals[key] == nil and context and context.mode then
+			return stub('fenv[' .. fmt(key) .. ']')
+		end
+		return globals[key]
+	end,
+	__newindex = function(_, key, value)
+		fenv()
+		local text = 'fenv[' .. fmt(key) .. '] = ' .. fmt(value)
+		emit(text)
+		globals[key] = value
+	end,
 })
-local run_ok,run_error=host_pcall(function()
- local chunk,load_error=luau.load(source,{debugName=input_path,environment=env,injectGlobals=false})
- if not chunk then host_error(load_error or "failed to load input",0) end
- chunk()
-end)
-local lines={}
-local seen_access={}
-local variable_count=0
-for _,event in host_ipairs(events) do
- local code
- if event.kind=="access" and not event.skip then
-  if not seen_access[event.code] then
-   seen_access[event.code]=true
-   variable_count+=1
-   code="local v"..variable_count.." = "..event.code
-  end
- elseif event.kind=="call" and not event.skip then
-  variable_count+=1
-  code="local v"..variable_count.." = "..event.code
- elseif event.kind=="expression" and not event.skip then
-  variable_count+=1
-  code="local v"..variable_count.." = "..event.code
- elseif event.kind=="statement" then
-  code=event.code
- end
- if code and code~="" then host_table.insert(lines,code) end
+local ok, fn = pcall(loadChunk, fs.readFile(input), input)
+if ok then
+	launch('spawn', 0, fn)
+else
+	errors[#errors + 1] = tostring(fn)
 end
-fs.writeFile(output_path,host_table.concat(lines,"\n")..(#lines>0 and "\n" or ""))
-if not run_ok then host_print("runtime error: "..host_tostring(run_error)) end
-host_print("logged "..#events.." events")
-host_print("written to "..output_path)
+
+local deadline = os.clock() + 10
+while os.clock() < deadline do
+	local running = false
+	for _, co in jobs do
+		if coroutine.status(co) ~= 'dead' then
+			running = true
+			break
+		end
+	end
+	if not running then break end
+	task.wait(0.001)
+end
+for _, co in jobs do
+	if coroutine.status(co) ~= 'dead' then
+		task.cancel(co)
+		errors[#errors + 1] = 'task timeout'
+	end
+end
+useMocks = true
+local explorationDeadline = os.clock() + 4
+local position = 1
+while position <= #callbacks and position <= 128 and os.clock() < explorationDeadline do
+	local record = callbacks[position]
+	if not record.observed then
+		record.explored = true
+		local values = { n = record.arity }
+		for i = 1, record.arity do
+			values[i] = stub('arg' .. i)
+		end
+		local hint = record.hint
+		if hint and record.arity > 0 and type(hint.Default) == 'boolean' then
+			record.cases = { {}, {} }
+			values[1] = true
+			probe(record, values, record.cases[1])
+			values[1] = false
+			probe(record, values, record.cases[2])
+		else
+			if hint and record.arity > 0 then
+				values[1] = hint.Default or (hint.Values and hint.Values[1]) or values[1]
+			end
+			probe(record, values, record.rows)
+		end
+	end
+	position += 1
+end
+
+local render
+local function renderRows(rows)
+	local result = {}
+	for _, row in rows do
+		if row[1] then result[#result + 1] = render(row[1]) end
+	end
+	return table.concat(result, '\n')
+end
+
+render = function(text)
+	return (
+		text:gsub('\1(%d+)\2', function(id)
+			local record = callbacks[tonumber(id)]
+			if record.rendering then return 'function(...) end' end
+			record.rendering = true
+			local params = {}
+			for i = 1, record.arity do
+				params[#params + 1] = 'arg' .. i
+			end
+			if record.vararg then params[#params + 1] = '...' end
+			local body = renderRows(record.rows)
+			if record.cases then
+				local yes, no = renderRows(record.cases[1]), renderRows(record.cases[2])
+				if yes ~= '' or no ~= '' then
+					body = 'if arg1 then\n\t'
+						.. yes:gsub('\n', '\n\t')
+						.. '\nelse\n\t'
+						.. no:gsub('\n', '\n\t')
+						.. '\nend'
+				end
+			end
+			if body == '' and record.explored then body = '--no env calls got' end
+			if not record.explored and not record.observed then
+				body = '--failed to explore callback'
+			end
+			record.rendering = nil
+			local signature = 'function(' .. table.concat(params, ', ') .. ')'
+			if body == '' then return signature .. ' end' end
+			return signature .. '\n\t' .. body:gsub('\n', '\n\t') .. '\nend'
+		end)
+	)
+end
+
+local output = renderRows(lines) .. '\n'
+fs.writeFile(process.args[2] or 'out.lua', output)
+local _, lineCount = output:gsub('\n', '')
+print(lineCount .. ' lines')
+for _, err in errors do
+	warn(err)
+end
+if #errors > 0 then process.exit(1) end
+
+--credits to : v1x , .Anonym in discord
